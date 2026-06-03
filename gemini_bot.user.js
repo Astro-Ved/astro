@@ -24,11 +24,28 @@
         maxImageSize: GM_getValue('gemini_max_size', 320), // Scale down canvas for low latency
         model: GM_getValue('gemini_model', 'gemini-2.5-flash'), // Added model selection
         gameplayFeedback: GM_getValue('gemini_feedback', ''), // User feedback to improve gameplay
-        menuVisible: true
+        menuVisible: true,
+        videoElement: null, // For screen capture fallback
+        virtualCursor: null // Virtual mouse pointer
     };
 
     // --- UI Setup ---
     function initUI() {
+        // Create Virtual Cursor
+        const cursor = document.createElement('div');
+        cursor.id = 'gemini-virtual-cursor';
+        cursor.style.cssText = `
+            position: fixed; width: 15px; height: 15px;
+            background-color: red; border-radius: 50%;
+            border: 2px solid white; z-index: 9999999;
+            pointer-events: none; /* Let clicks pass through to game */
+            transform: translate(-50%, -50%);
+            display: none;
+            box-shadow: 0 0 5px rgba(0,0,0,0.5);
+        `;
+        document.body.appendChild(cursor);
+        STATE.virtualCursor = cursor;
+
         const panel = document.createElement('div');
         panel.id = 'gemini-bot-panel';
         panel.style.cssText = `
@@ -104,16 +121,29 @@
             updateStatus("Settings saved locally!");
         });
 
-        document.getElementById('gemini-toggle').addEventListener('click', (e) => {
+        document.getElementById('gemini-toggle').addEventListener('click', async (e) => {
             STATE.isRunning = !STATE.isRunning;
             e.target.innerText = STATE.isRunning ? 'STOP BOT' : 'START BOT';
             e.target.style.background = STATE.isRunning ? '#440000' : '#004400';
             e.target.style.color = STATE.isRunning ? '#ff0000' : '#00ff00';
 
             if (STATE.isRunning) {
+                if (STATE.captureEnabled && !STATE.videoElement) {
+                    updateStatus("Requesting screen capture...");
+                    const success = await initScreenCapture();
+                    if (!success) {
+                        STATE.isRunning = false;
+                        e.target.innerText = 'START BOT';
+                        e.target.style.background = '#004400';
+                        e.target.style.color = '#00ff00';
+                        return;
+                    }
+                }
+                if (STATE.virtualCursor) STATE.virtualCursor.style.display = 'block';
                 updateStatus("Bot started...");
                 gameLoop();
             } else {
+                if (STATE.virtualCursor) STATE.virtualCursor.style.display = 'none';
                 updateStatus("Bot stopped.");
             }
         });
@@ -125,43 +155,87 @@
     }
 
     // --- Screen Capture ---
-    function captureGameState() {
+    async function initScreenCapture() {
+        if (STATE.videoElement) return true; // Already initialized
+        try {
+            const stream = await navigator.mediaDevices.getDisplayMedia({
+                video: { cursor: "never" },
+                audio: false
+            });
+            STATE.videoElement = document.createElement('video');
+            STATE.videoElement.srcObject = stream;
+            STATE.videoElement.play();
+            return new Promise((resolve) => {
+                STATE.videoElement.onloadedmetadata = () => resolve(true);
+            });
+        } catch (err) {
+            updateStatus("Screen capture permission denied.");
+            console.error("Screen capture failed:", err);
+            return false;
+        }
+    }
+
+    async function captureGameState() {
         if (!STATE.captureEnabled) return null;
 
-        // Try to find the game canvas
-        const canvases = document.querySelectorAll('canvas');
-        if (canvases.length === 0) return null;
+        let sourceNode = null;
 
-        // Assume the largest canvas is the game
-        let targetCanvas = canvases[0];
-        let maxArea = targetCanvas.width * targetCanvas.height;
-        for (let i = 1; i < canvases.length; i++) {
-            let area = canvases[i].width * canvases[i].height;
-            if (area > maxArea) {
-                maxArea = area;
-                targetCanvas = canvases[i];
+        // Use video capture as primary if available (bypasses WebGL canvas tainting)
+        if (STATE.videoElement && STATE.videoElement.readyState >= 2) {
+            sourceNode = STATE.videoElement;
+        } else {
+            // Fallback to searching for canvas
+            const canvases = document.querySelectorAll('canvas');
+            if (canvases.length > 0) {
+                let targetCanvas = canvases[0];
+                let maxArea = targetCanvas.width * targetCanvas.height;
+                for (let i = 1; i < canvases.length; i++) {
+                    let area = canvases[i].width * canvases[i].height;
+                    if (area > maxArea) {
+                        maxArea = area;
+                        targetCanvas = canvases[i];
+                    }
+                }
+                sourceNode = targetCanvas;
             }
         }
 
+        if (!sourceNode) return null;
+
         // Scale down for latency
         const offscreen = document.createElement('canvas');
-        const scale = Math.min(STATE.maxImageSize / targetCanvas.width, STATE.maxImageSize / targetCanvas.height, 1);
-        offscreen.width = targetCanvas.width * scale;
-        offscreen.height = targetCanvas.height * scale;
+        const srcWidth = sourceNode.videoWidth || sourceNode.width;
+        const srcHeight = sourceNode.videoHeight || sourceNode.height;
+
+        if (!srcWidth || !srcHeight) return null;
+
+        const scale = Math.min(STATE.maxImageSize / srcWidth, STATE.maxImageSize / srcHeight, 1);
+        offscreen.width = srcWidth * scale;
+        offscreen.height = srcHeight * scale;
 
         const ctx = offscreen.getContext('2d');
-        ctx.drawImage(targetCanvas, 0, 0, offscreen.width, offscreen.height);
-
-        // Return base64 without prefix
-        const dataUrl = offscreen.toDataURL('image/jpeg', 0.5);
-        return dataUrl.split(',')[1];
+        try {
+            ctx.drawImage(sourceNode, 0, 0, offscreen.width, offscreen.height);
+            // Return base64 without prefix
+            const dataUrl = offscreen.toDataURL('image/jpeg', 0.5);
+            return dataUrl.split(',')[1];
+        } catch (e) {
+            // Tainted canvas! We need screen capture.
+            if (!STATE.videoElement) {
+                updateStatus("Canvas tainted! Please click START BOT again to grant screen capture permission.");
+                STATE.isRunning = false;
+                document.getElementById('gemini-toggle').innerText = 'START BOT';
+                document.getElementById('gemini-toggle').style.background = '#004400';
+                document.getElementById('gemini-toggle').style.color = '#00ff00';
+            }
+            throw e;
+        }
     }
 
     // --- Action Execution ---
     function executeActions(actionsText) {
         try {
-            // Expecting Gemini to return a JSON array like: [{"type": "keydown", "key": "w"}, {"type": "mousedown", "button": 0}]
-            // Extract JSON from potential markdown blocks
+            // Expecting format like: ["PRESS: w", "MOUSE: 500, 300"]
             const jsonMatch = actionsText.match(/\[.*\]/s) || actionsText.match(/\{.*\}/s);
             if (!jsonMatch) {
                 updateStatus("No parseable JSON in response:\n" + actionsText.substring(0, 50));
@@ -175,27 +249,56 @@
 
             const target = document.querySelectorAll('canvas')[0] || document.body;
 
-            actions.forEach(action => {
-                if (action.type === 'keydown' || action.type === 'keyup') {
-                    const keyVal = action.key || '';
+            actions.forEach(actionStr => {
+                if (typeof actionStr !== 'string') return;
+
+                if (actionStr.startsWith('PRESS:')) {
+                    const keyVal = actionStr.split(':')[1].trim();
                     const upperKey = keyVal.toUpperCase();
-                    const evt = new KeyboardEvent(action.type, {
+
+                    // Simulate Keydown
+                    document.dispatchEvent(new KeyboardEvent('keydown', {
                         key: keyVal,
-                        code: action.code || `Key${upperKey}`,
+                        code: `Key${upperKey}`,
                         keyCode: upperKey.charCodeAt(0) || 0,
-                        bubbles: true,
-                        cancelable: true
-                    });
-                    document.dispatchEvent(evt);
-                } else if (action.type === 'mousedown' || action.type === 'mouseup' || action.type === 'click') {
-                    const evt = new MouseEvent(action.type, {
-                        button: action.button || 0,
-                        clientX: action.x || window.innerWidth / 2,
-                        clientY: action.y || window.innerHeight / 2,
-                        bubbles: true,
-                        cancelable: true
-                    });
-                    target.dispatchEvent(evt);
+                        bubbles: true, cancelable: true
+                    }));
+
+                    // Simulate Keyup after slight delay
+                    setTimeout(() => {
+                        document.dispatchEvent(new KeyboardEvent('keyup', {
+                            key: keyVal,
+                            code: `Key${upperKey}`,
+                            keyCode: upperKey.charCodeAt(0) || 0,
+                            bubbles: true, cancelable: true
+                        }));
+                    }, 50);
+
+                } else if (actionStr.startsWith('MOUSE:')) {
+                    const coords = actionStr.split(':')[1].split(',');
+                    const x = parseInt(coords[0].trim());
+                    const y = parseInt(coords[1].trim());
+
+                    if (!isNaN(x) && !isNaN(y)) {
+                        // Move Virtual Cursor
+                        if (STATE.virtualCursor) {
+                            STATE.virtualCursor.style.left = `${x}px`;
+                            STATE.virtualCursor.style.top = `${y}px`;
+                        }
+
+                        // Dispatch Mouse events at coordinates
+                        const evtInit = {
+                            clientX: x, clientY: y,
+                            bubbles: true, cancelable: true,
+                            view: window
+                        };
+                        target.dispatchEvent(new MouseEvent('mousemove', evtInit));
+                        target.dispatchEvent(new MouseEvent('mousedown', Object.assign({button: 0}, evtInit)));
+                        setTimeout(() => {
+                            target.dispatchEvent(new MouseEvent('mouseup', Object.assign({button: 0}, evtInit)));
+                            target.dispatchEvent(new MouseEvent('click', Object.assign({button: 0}, evtInit)));
+                        }, 50);
+                    }
                 }
             });
 
@@ -219,11 +322,14 @@
 Your goal is to analyze the screen and output commands to play the game optimally.
 The user has mapped the following controls for this game: ${STATE.controls}
 
-Output ONLY a raw JSON array of objects representing actions you want to take right now. Do not wrap in markdown tags.
+Output ONLY a raw JSON array of strings representing actions you want to take right now. Do not wrap in markdown tags.
+To press a key, use the format: "PRESS: key_name"
+To click the mouse at a specific screen coordinate, use the format: "MOUSE: x, y"
+
 Example format:
 [
-  {"type": "keydown", "key": "w"},
-  {"type": "mousedown", "button": 0}
+  "PRESS: w",
+  "MOUSE: 500, 300"
 ]`;
 
             if (STATE.gameplayFeedback.trim() !== '') {
@@ -295,7 +401,7 @@ Example format:
         updateStatus("Capturing screen...");
 
         try {
-            const imgData = captureGameState();
+            const imgData = await captureGameState();
             updateStatus("Asking Gemini...");
 
             const start = performance.now();
