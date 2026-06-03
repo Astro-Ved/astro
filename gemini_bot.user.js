@@ -89,6 +89,9 @@
             <button id="gemini-toggle" style="background: #004400; color: #00ff00; border: 1px solid #00ff00; padding: 10px; cursor: pointer; width: 100%; font-weight: bold;">START BOT</button>
 
             <div id="gemini-status" style="margin-top: 10px; color: #aaa; white-space: pre-wrap; font-size: 10px;">Status: Idle</div>
+
+            <label style="display:block; margin-top:10px;">Live AI Responses:</label>
+            <div id="gemini-live-log" style="width: 100%; height: 80px; margin-top: 5px; background: #111; color: #0f0; border: 1px solid #555; overflow-y: auto; font-size: 10px; padding: 5px; box-sizing: border-box; white-space: pre-wrap;"></div>
         `;
 
         document.body.appendChild(panel);
@@ -152,6 +155,14 @@
     function updateStatus(msg) {
         const statusEl = document.getElementById('gemini-status');
         if (statusEl) statusEl.innerText = `Status: ${msg}`;
+    }
+
+    function appendLiveLog(msg) {
+        const logEl = document.getElementById('gemini-live-log');
+        if (logEl) {
+            logEl.innerText += msg + '\n';
+            logEl.scrollTop = logEl.scrollHeight;
+        }
     }
 
     // --- Screen Capture ---
@@ -234,11 +245,12 @@
 
     // --- Action Execution ---
     function executeActions(actionsText) {
+        appendLiveLog(actionsText.trim());
         try {
             // Expecting format like: ["PRESS: w", "MOUSE: 500, 300"]
             const jsonMatch = actionsText.match(/\[.*\]/s) || actionsText.match(/\{.*\}/s);
             if (!jsonMatch) {
-                updateStatus("No parseable JSON in response:\n" + actionsText.substring(0, 50));
+                updateStatus("No parseable JSON in response.");
                 return;
             }
 
