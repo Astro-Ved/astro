@@ -23,6 +23,7 @@
         latencyMs: GM_getValue('gemini_latency', 500), // Delay between actions
         maxImageSize: GM_getValue('gemini_max_size', 320), // Scale down canvas for low latency
         model: GM_getValue('gemini_model', 'gemini-2.5-flash'), // Added model selection
+        gameplayFeedback: GM_getValue('gemini_feedback', ''), // User feedback to improve gameplay
         menuVisible: true
     };
 
@@ -52,6 +53,9 @@
 
             <label>Game Controls Prompt (Saved per site):</label><br>
             <textarea id="gemini-controls" style="width: 100%; height: 60px; margin-bottom: 10px; background: #222; color: #fff; border: 1px solid #555;">${STATE.controls}</textarea>
+
+            <label>Gameplay Feedback/Hints (Real-time hints to the AI):</label><br>
+            <textarea id="gemini-feedback" style="width: 100%; height: 40px; margin-bottom: 10px; background: #222; color: #fff; border: 1px solid #555;" placeholder="e.g., Focus on headshots, dodge left...">${STATE.gameplayFeedback}</textarea>
 
             <label>
                 <input type="checkbox" id="gemini-capture" ${STATE.captureEnabled ? 'checked' : ''}> Enable Screen Capture (Vision)
@@ -84,6 +88,7 @@
             STATE.apiKey = document.getElementById('gemini-apikey').value;
             STATE.model = document.getElementById('gemini-model').value;
             STATE.controls = document.getElementById('gemini-controls').value;
+            STATE.gameplayFeedback = document.getElementById('gemini-feedback').value;
             STATE.captureEnabled = document.getElementById('gemini-capture').checked;
             STATE.latencyMs = parseInt(document.getElementById('gemini-latency').value, 10) || 500;
             STATE.maxImageSize = parseInt(document.getElementById('gemini-max-size').value, 10) || 320;
@@ -91,6 +96,7 @@
             GM_setValue('gemini_api_key', STATE.apiKey);
             GM_setValue('gemini_model', STATE.model);
             GM_setValue(`controls_${window.location.hostname}`, STATE.controls);
+            GM_setValue('gemini_feedback', STATE.gameplayFeedback);
             GM_setValue('gemini_capture', STATE.captureEnabled);
             GM_setValue('gemini_latency', STATE.latencyMs);
             GM_setValue('gemini_max_size', STATE.maxImageSize);
@@ -171,10 +177,12 @@
 
             actions.forEach(action => {
                 if (action.type === 'keydown' || action.type === 'keyup') {
+                    const keyVal = action.key || '';
+                    const upperKey = keyVal.toUpperCase();
                     const evt = new KeyboardEvent(action.type, {
-                        key: action.key,
-                        code: action.code || `Key${action.key.toUpperCase()}`,
-                        keyCode: action.key.toUpperCase().charCodeAt(0),
+                        key: keyVal,
+                        code: action.code || `Key${upperKey}`,
+                        keyCode: upperKey.charCodeAt(0) || 0,
                         bubbles: true,
                         cancelable: true
                     });
@@ -207,9 +215,7 @@
 
             const url = `https://generativelanguage.googleapis.com/v1beta/models/${STATE.model}:generateContent?key=${STATE.apiKey}`;
 
-            const parts = [
-                {
-                    text: `You are an automated game-playing AI bot playing a game on a web browser.
+            let promptText = `You are an automated game-playing AI bot playing a game on a web browser.
 Your goal is to analyze the screen and output commands to play the game optimally.
 The user has mapped the following controls for this game: ${STATE.controls}
 
@@ -218,9 +224,17 @@ Example format:
 [
   {"type": "keydown", "key": "w"},
   {"type": "mousedown", "button": 0}
-]
+]`;
 
-Analyze the screen state and make the best move. Keep it brief and output ONLY the JSON array.`
+            if (STATE.gameplayFeedback.trim() !== '') {
+                promptText += `\n\nUSER GAMEPLAY FEEDBACK/HINTS (Prioritize these instructions): ${STATE.gameplayFeedback}`;
+            }
+
+            promptText += `\n\nAnalyze the screen state and make the best move. Keep it brief and output ONLY the JSON array.`;
+
+            const parts = [
+                {
+                    text: promptText
                 }
             ];
 
@@ -305,7 +319,11 @@ Analyze the screen state and make the best move. Keep it brief and output ONLY t
 
     // Initialize
     if (typeof window !== 'undefined') {
-        window.addEventListener('load', initUI);
+        if (document.readyState === 'complete' || document.readyState === 'interactive') {
+            initUI();
+        } else {
+            window.addEventListener('DOMContentLoaded', initUI);
+        }
     }
 
 })();
