@@ -19,14 +19,17 @@
         isProcessing: false, // Prevent overlapping API calls
         apiKey: GM_getValue('gemini_api_key', ''),
         controls: GM_getValue(`controls_${window.location.hostname}`, 'W, A, S, D, Left Click'),
-        captureEnabled: true,
-        latencyMs: 500, // Delay between actions
-        maxImageSize: 320 // Scale down canvas for low latency
+        captureEnabled: GM_getValue('gemini_capture', true),
+        latencyMs: GM_getValue('gemini_latency', 500), // Delay between actions
+        maxImageSize: GM_getValue('gemini_max_size', 320), // Scale down canvas for low latency
+        model: GM_getValue('gemini_model', 'gemini-2.5-flash'), // Added model selection
+        menuVisible: true
     };
 
     // --- UI Setup ---
     function initUI() {
         const panel = document.createElement('div');
+        panel.id = 'gemini-bot-panel';
         panel.style.cssText = `
             position: fixed; top: 10px; right: 10px; width: 300px;
             background: rgba(0, 0, 0, 0.85); color: #00ff00;
@@ -35,16 +38,30 @@
         `;
 
         panel.innerHTML = `
-            <h3 style="margin: 0 0 10px 0; color: #fff;">🤖 Gemini Game Bot</h3>
+            <h3 style="margin: 0 0 10px 0; color: #fff;">🤖 Gemini Game Bot <span style="font-size:10px;color:#aaa;">(Toggle: Insert)</span></h3>
 
             <label>API Key:</label><br>
             <input type="password" id="gemini-apikey" value="${STATE.apiKey}" style="width: 100%; margin-bottom: 10px; background: #222; color: #fff; border: 1px solid #555;">
+
+            <label>Model:</label><br>
+            <select id="gemini-model" style="width: 100%; margin-bottom: 10px; background: #222; color: #fff; border: 1px solid #555;">
+                <option value="gemini-2.5-flash" ${STATE.model === 'gemini-2.5-flash' ? 'selected' : ''}>Gemini 2.5 Flash</option>
+                <option value="gemini-2.5-pro" ${STATE.model === 'gemini-2.5-pro' ? 'selected' : ''}>Gemini 2.5 Pro</option>
+                <option value="gemini-1.5-flash" ${STATE.model === 'gemini-1.5-flash' ? 'selected' : ''}>Gemini 1.5 Flash</option>
+            </select><br>
 
             <label>Game Controls Prompt (Saved per site):</label><br>
             <textarea id="gemini-controls" style="width: 100%; height: 60px; margin-bottom: 10px; background: #222; color: #fff; border: 1px solid #555;">${STATE.controls}</textarea>
 
             <label>
                 <input type="checkbox" id="gemini-capture" ${STATE.captureEnabled ? 'checked' : ''}> Enable Screen Capture (Vision)
+            </label><br>
+
+            <label style="display:inline-block; margin-top:10px; width:50%;">Latency (ms):<br>
+                <input type="number" id="gemini-latency" value="${STATE.latencyMs}" style="width: 90%; background: #222; color: #fff; border: 1px solid #555;">
+            </label>
+            <label style="display:inline-block; margin-top:10px; width:45%;">Max Res (px):<br>
+                <input type="number" id="gemini-max-size" value="${STATE.maxImageSize}" style="width: 100%; background: #222; color: #fff; border: 1px solid #555;">
             </label><br><br>
 
             <button id="gemini-save" style="background: #333; color: #fff; border: 1px solid #00ff00; padding: 5px; cursor: pointer; width: 100%; margin-bottom: 10px;">Save Settings</button>
@@ -55,13 +72,29 @@
 
         document.body.appendChild(panel);
 
+        // Toggle menu with Insert key
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'Insert') {
+                STATE.menuVisible = !STATE.menuVisible;
+                panel.style.display = STATE.menuVisible ? 'block' : 'none';
+            }
+        });
+
         document.getElementById('gemini-save').addEventListener('click', () => {
             STATE.apiKey = document.getElementById('gemini-apikey').value;
+            STATE.model = document.getElementById('gemini-model').value;
             STATE.controls = document.getElementById('gemini-controls').value;
             STATE.captureEnabled = document.getElementById('gemini-capture').checked;
+            STATE.latencyMs = parseInt(document.getElementById('gemini-latency').value, 10) || 500;
+            STATE.maxImageSize = parseInt(document.getElementById('gemini-max-size').value, 10) || 320;
 
             GM_setValue('gemini_api_key', STATE.apiKey);
+            GM_setValue('gemini_model', STATE.model);
             GM_setValue(`controls_${window.location.hostname}`, STATE.controls);
+            GM_setValue('gemini_capture', STATE.captureEnabled);
+            GM_setValue('gemini_latency', STATE.latencyMs);
+            GM_setValue('gemini_max_size', STATE.maxImageSize);
+
             updateStatus("Settings saved locally!");
         });
 
@@ -172,7 +205,7 @@
                 return;
             }
 
-            const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${STATE.apiKey}`;
+            const url = `https://generativelanguage.googleapis.com/v1beta/models/${STATE.model}:generateContent?key=${STATE.apiKey}`;
 
             const parts = [
                 {
