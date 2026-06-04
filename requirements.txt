@@ -6,3 +6,6 @@ pillow
 numpy
 playwright
 requests
+transformers
+einops
+timm

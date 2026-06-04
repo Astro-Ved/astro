@@ -10,31 +10,52 @@ import torch.optim as optim
 import random
 from collections import deque
 from playwright.sync_api import sync_playwright
-import urllib.request
+from transformers import AutoProcessor, AutoModelForCausalLM
+from PIL import Image
 
-# URL for a hypothetical pretrained reward model (using a placeholder domain for demonstration)
-MODEL_URL = "https://example.com/models/reward_model_v1.pth"
-MODEL_FILE = "reward_model.pth"
+class FlorenceRewardModel:
+    """Uses Florence-2 to determine if the game is over using VQA."""
+    def __init__(self, device):
+        self.device = device
+        self.model_id = 'microsoft/Florence-2-base'
+        print(f"Loading {self.model_id} (this may take a while on first run)...")
+        # Load model and processor. Hugging Face handles the caching automatically.
+        self.model = AutoModelForCausalLM.from_pretrained(self.model_id, trust_remote_code=True).to(self.device).eval()
+        self.processor = AutoProcessor.from_pretrained(self.model_id, trust_remote_code=True)
+        print("Florence-2 loaded successfully.")
 
-class RewardModel(nn.Module):
-    """A lightweight CNN to determine if the game is over or a score happened."""
-    def __init__(self, input_channels):
-        super(RewardModel, self).__init__()
-        self.conv1 = nn.Conv2d(input_channels, 8, kernel_size=8, stride=4)
-        self.conv2 = nn.Conv2d(8, 16, kernel_size=4, stride=2)
-        # Output: [reward_value, done_prob]
-        self.fc = nn.Linear(16 * 9 * 9, 2)
+    def evaluate_game_state(self, image_np, prompt="Is there a game over or you died text in this image? Answer yes or no."):
+        # Convert grayscale numpy back to PIL image for Florence
+        # Since our previous capture is 84x84 grayscale, we might want to capture in color for Florence,
+        # but if we are passing the 84x84 gray:
+        if len(image_np.shape) == 2:
+            img = Image.fromarray(image_np).convert("RGB")
+        else:
+            img = Image.fromarray(image_np)
 
-    def forward(self, x):
-        x = torch.relu(self.conv1(x))
-        x = torch.relu(self.conv2(x))
-        x = x.view(x.size(0), -1)
-        out = self.fc(x)
-        # out[:, 0] = continuous/discrete reward
-        # out[:, 1] = probability of 'done' (sigmoid)
-        reward = out[:, 0]
-        done_prob = torch.sigmoid(out[:, 1])
-        return reward, done_prob
+        task_prompt = f"<vqa> {prompt}"
+
+        inputs = self.processor(text=task_prompt, images=img, return_tensors="pt").to(self.device)
+
+        with torch.no_grad():
+            generated_ids = self.model.generate(
+                input_ids=inputs["input_ids"],
+                pixel_values=inputs["pixel_values"],
+                max_new_tokens=10,
+                num_beams=3
+            )
+
+        generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+        parsed_answer = self.processor.post_process_generation(generated_text, task=task_prompt, image_size=(img.width, img.height))
+
+        answer = parsed_answer.get('<vqa>', '').lower()
+
+        # Simple heuristic based on the answer
+        is_done = 'yes' in answer
+        # If it's not done, we assume a continuous small reward. If done, we penalize.
+        reward = -1.0 if is_done else 0.1
+
+        return reward, is_done
 
 class SimpleDQN(nn.Module):
     """A very lightweight CNN for a potato PC."""
@@ -151,17 +172,7 @@ class RLBotGUI:
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
 
         # Reward Model Setup
-        self.reward_model = RewardModel(1).to(self.device)
-        self.ensure_model_downloaded()
-
-        try:
-            # We use weights_only=True to prevent potential security warnings or issues with pickle
-            self.reward_model.load_state_dict(torch.load(MODEL_FILE, map_location=self.device, weights_only=True))
-            print("Successfully loaded Reward Model weights.")
-        except Exception as e:
-            print(f"Warning: Could not load reward model weights: {e}. Using uninitialized weights.")
-
-        self.reward_model.eval() # Since it just predicts, we keep it in eval mode
+        self.reward_model = FlorenceRewardModel(self.device)
 
         self.memory = ReplayBuffer(5000)
         self.batch_size = 32
@@ -177,6 +188,8 @@ class RLBotGUI:
         self.exp_folder = tk.StringVar()
         self.is_running = False
 
+        self.prompt_text = tk.StringVar(value="Is there a game over or you died text in this image? Answer yes or no.")
+
         # URL Selection
         ttk.Label(self.root, text="Game URL:").grid(row=0, column=0, padx=10, pady=10, sticky="w")
         ttk.Entry(self.root, textvariable=self.target_url, width=40).grid(row=0, column=1, padx=10, pady=10)
@@ -186,24 +199,13 @@ class RLBotGUI:
         ttk.Entry(self.root, textvariable=self.exp_folder, width=40, state="readonly").grid(row=1, column=1, padx=10, pady=10)
         ttk.Button(self.root, text="Browse", command=self.browse_folder).grid(row=1, column=2, padx=10, pady=10)
 
+        # Florence Prompt
+        ttk.Label(self.root, text="Game Over Prompt:").grid(row=2, column=0, padx=10, pady=10, sticky="w")
+        ttk.Entry(self.root, textvariable=self.prompt_text, width=40).grid(row=2, column=1, padx=10, pady=10)
+
         # Controls
         self.start_btn = ttk.Button(self.root, text="Start", command=self.toggle_bot)
-        self.start_btn.grid(row=2, column=1, pady=20)
-
-    def ensure_model_downloaded(self):
-        if not os.path.exists(MODEL_FILE):
-            print(f"Reward model not found locally. Downloading from {MODEL_URL}...")
-            try:
-                # We mock the download if example.com is used, to avoid real network errors in this demo
-                if "example.com" in MODEL_URL:
-                    print("Using mock download for demo domain...")
-                    # Save a dummy state dict using the initialized weights
-                    torch.save(self.reward_model.state_dict(), MODEL_FILE)
-                else:
-                    urllib.request.urlretrieve(MODEL_URL, MODEL_FILE)
-                print("Download complete.")
-            except Exception as e:
-                print(f"Failed to download model: {e}")
+        self.start_btn.grid(row=3, column=1, pady=20)
 
     def browse_folder(self):
         folder = filedialog.askdirectory()
@@ -280,14 +282,9 @@ class RLBotGUI:
             if next_state is None:
                 continue
 
-            # Use the RewardModel to evaluate the frame
-            with torch.no_grad():
-                ns_tensor = torch.FloatTensor(next_state).unsqueeze(0).unsqueeze(0).to(self.device)
-                pred_reward, pred_done = self.reward_model(ns_tensor)
-
-                reward = pred_reward.item()
-                # If probability of done is > 0.5, we consider the episode finished
-                done = pred_done.item() > 0.5
+            # Use the FlorenceRewardModel to evaluate the frame
+            prompt = self.prompt_text.get()
+            reward, done = self.reward_model.evaluate_game_state(next_state, prompt=prompt)
 
             # Store experience
             self.memory.push(state, action, reward, next_state, done)
