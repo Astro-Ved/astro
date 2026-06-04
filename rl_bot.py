@@ -10,6 +10,11 @@ import torch.optim as optim
 import random
 from collections import deque
 from playwright.sync_api import sync_playwright
+import urllib.request
+
+# URL for a hypothetical pretrained reward model (using a placeholder domain for demonstration)
+MODEL_URL = "https://example.com/models/reward_model_v1.pth"
+MODEL_FILE = "reward_model.pth"
 
 class RewardModel(nn.Module):
     """A lightweight CNN to determine if the game is over or a score happened."""
@@ -140,10 +145,6 @@ class RLBotGUI:
     def __init__(self, root):
         self.root = root
 
-        # Chrome Debugging
-        self.chrome_port = tk.StringVar(value="9222")
-        self.pages_data = []
-
         # RL Setup
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = SimpleDQN(1, len(ACTIONS)).to(self.device)
@@ -151,8 +152,15 @@ class RLBotGUI:
 
         # Reward Model Setup
         self.reward_model = RewardModel(1).to(self.device)
-        # In a real scenario, you'd load pre-trained weights for the reward model
-        # self.reward_model.load_state_dict(torch.load('reward_model.pth'))
+        self.ensure_model_downloaded()
+
+        try:
+            # We use weights_only=True to prevent potential security warnings or issues with pickle
+            self.reward_model.load_state_dict(torch.load(MODEL_FILE, map_location=self.device, weights_only=True))
+            print("Successfully loaded Reward Model weights.")
+        except Exception as e:
+            print(f"Warning: Could not load reward model weights: {e}. Using uninitialized weights.")
+
         self.reward_model.eval() # Since it just predicts, we keep it in eval mode
 
         self.memory = ReplayBuffer(5000)
@@ -165,47 +173,37 @@ class RLBotGUI:
         self.bot_thread = None
         self.root.title("RL Game Bot")
 
-        self.target_tab = tk.StringVar()
+        self.target_url = tk.StringVar(value="https://chromedino.com/")
         self.exp_folder = tk.StringVar()
         self.is_running = False
 
-        # Port Selection
-        ttk.Label(root, text="Chrome Debugging Port:").grid(row=0, column=0, padx=10, pady=10, sticky="w")
-        ttk.Entry(root, textvariable=self.chrome_port, width=10).grid(row=0, column=1, sticky="w", padx=10)
-
-        # Tab Selection
-        ttk.Label(root, text="Select Target Tab:").grid(row=1, column=0, padx=10, pady=10, sticky="w")
-        self.tab_combobox = ttk.Combobox(root, textvariable=self.target_tab, width=40)
-        self.tab_combobox.grid(row=1, column=1, padx=10, pady=10)
-        self.refresh_tabs()
-
-        ttk.Button(root, text="Refresh", command=self.refresh_tabs).grid(row=1, column=2, padx=10, pady=10)
+        # URL Selection
+        ttk.Label(self.root, text="Game URL:").grid(row=0, column=0, padx=10, pady=10, sticky="w")
+        ttk.Entry(self.root, textvariable=self.target_url, width=40).grid(row=0, column=1, padx=10, pady=10)
 
         # Experience Folder Selection
-        ttk.Label(root, text="Experience Folder:").grid(row=2, column=0, padx=10, pady=10, sticky="w")
-        ttk.Entry(root, textvariable=self.exp_folder, width=40, state="readonly").grid(row=2, column=1, padx=10, pady=10)
-        ttk.Button(root, text="Browse", command=self.browse_folder).grid(row=2, column=2, padx=10, pady=10)
+        ttk.Label(self.root, text="Experience Folder:").grid(row=1, column=0, padx=10, pady=10, sticky="w")
+        ttk.Entry(self.root, textvariable=self.exp_folder, width=40, state="readonly").grid(row=1, column=1, padx=10, pady=10)
+        ttk.Button(self.root, text="Browse", command=self.browse_folder).grid(row=1, column=2, padx=10, pady=10)
 
         # Controls
-        self.start_btn = ttk.Button(root, text="Start", command=self.toggle_bot)
-        self.start_btn.grid(row=3, column=1, pady=20)
+        self.start_btn = ttk.Button(self.root, text="Start", command=self.toggle_bot)
+        self.start_btn.grid(row=2, column=1, pady=20)
 
-    def refresh_tabs(self):
-        try:
-            port = self.chrome_port.get()
-            response = requests.get(f"http://localhost:{port}/json")
-            if response.status_code == 200:
-                self.pages_data = [p for p in response.json() if p['type'] == 'page']
-                tab_titles = [f"{p['title']} ({p['url']})" for p in self.pages_data]
-                self.tab_combobox['values'] = tab_titles
-                if tab_titles:
-                    self.tab_combobox.current(0)
-            else:
-                messagebox.showwarning("Warning", "Could not fetch tabs. Make sure Chrome is running with --remote-debugging-port.")
-        except requests.exceptions.RequestException:
-            messagebox.showwarning("Warning", "Could not connect to Chrome. Make sure it is running with --remote-debugging-port=" + self.chrome_port.get())
-            self.tab_combobox['values'] = []
-            self.pages_data = []
+    def ensure_model_downloaded(self):
+        if not os.path.exists(MODEL_FILE):
+            print(f"Reward model not found locally. Downloading from {MODEL_URL}...")
+            try:
+                # We mock the download if example.com is used, to avoid real network errors in this demo
+                if "example.com" in MODEL_URL:
+                    print("Using mock download for demo domain...")
+                    # Save a dummy state dict using the initialized weights
+                    torch.save(self.reward_model.state_dict(), MODEL_FILE)
+                else:
+                    urllib.request.urlretrieve(MODEL_URL, MODEL_FILE)
+                print("Download complete.")
+            except Exception as e:
+                print(f"Failed to download model: {e}")
 
     def browse_folder(self):
         folder = filedialog.askdirectory()
@@ -213,8 +211,8 @@ class RLBotGUI:
             self.exp_folder.set(folder)
 
     def toggle_bot(self):
-        if not self.target_tab.get() or not self.pages_data:
-            messagebox.showerror("Error", "Please select a target tab.")
+        if not self.target_url.get():
+            messagebox.showerror("Error", "Please enter a target URL.")
             return
         if not self.exp_folder.get():
             messagebox.showerror("Error", "Please select an experience folder.")
@@ -223,16 +221,7 @@ class RLBotGUI:
         self.is_running = not self.is_running
         if self.is_running:
             self.start_btn.config(text="Stop")
-
-            selected_idx = self.tab_combobox.current()
-            if selected_idx < 0:
-                self.is_running = False
-                self.start_btn.config(text="Start")
-                return
-
-            self.selected_websocket_url = self.pages_data[selected_idx]['webSocketDebuggerUrl']
-
-            print(f"Bot started. Tab: {self.target_tab.get()}, Folder: {self.exp_folder.get()}")
+            print(f"Bot started. URL: {self.target_url.get()}, Folder: {self.exp_folder.get()}")
             self.bot_thread = threading.Thread(target=self.run_bot)
             self.bot_thread.start()
         else:
@@ -241,41 +230,21 @@ class RLBotGUI:
 
     def run_bot(self):
         exp_dir = self.exp_folder.get()
-        ws_url = getattr(self, 'selected_websocket_url', None)
-
-        if not ws_url:
-            print("No WebSocket URL found.")
-            self.is_running = False
-            self.root.after(0, lambda: self.start_btn.config(text="Start"))
-            return
+        url = self.target_url.get()
 
         try:
             with sync_playwright() as p:
-                browser = p.chromium.connect_over_cdp(ws_url)
-                # Usually there's one context and we find the page that matches the websocket
-                contexts = browser.contexts
-                if not contexts:
-                    print("No browser contexts found.")
-                    return
+                browser = p.chromium.launch(headless=False)
+                context = browser.new_context()
+                page = context.new_page()
+                page.goto(url)
 
-                target_page = None
-                for context in contexts:
-                    for page in context.pages:
-                        # Find the active page
-                        target_page = page
-                        break
-                    if target_page: break
+                self._rl_loop(page, exp_dir)
 
-                if not target_page:
-                    print("Could not attach to the specific page.")
-                    self.is_running = False
-                    self.root.after(0, lambda: self.start_btn.config(text="Start"))
-                    return
-
-                self._rl_loop(target_page, exp_dir)
+                browser.close()
 
         except Exception as e:
-            print(f"Playwright connection error: {e}")
+            print(f"Playwright error: {e}")
             self.is_running = False
             self.root.after(0, lambda: self.start_btn.config(text="Start"))
 
