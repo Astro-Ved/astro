@@ -2,8 +2,7 @@ torch
 torchvision
 torchaudio
 opencv-python
-mss
-pygetwindow
-pyautogui
 pillow
 numpy
+playwright
+requests

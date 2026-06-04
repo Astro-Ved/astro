@@ -1,8 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import pygetwindow as gw
+import requests
 import os
-import mss
 import cv2
 import numpy as np
 import torch
@@ -10,6 +9,27 @@ import torch.nn as nn
 import torch.optim as optim
 import random
 from collections import deque
+from playwright.sync_api import sync_playwright
+
+class RewardModel(nn.Module):
+    """A lightweight CNN to determine if the game is over or a score happened."""
+    def __init__(self, input_channels):
+        super(RewardModel, self).__init__()
+        self.conv1 = nn.Conv2d(input_channels, 8, kernel_size=8, stride=4)
+        self.conv2 = nn.Conv2d(8, 16, kernel_size=4, stride=2)
+        # Output: [reward_value, done_prob]
+        self.fc = nn.Linear(16 * 9 * 9, 2)
+
+    def forward(self, x):
+        x = torch.relu(self.conv1(x))
+        x = torch.relu(self.conv2(x))
+        x = x.view(x.size(0), -1)
+        out = self.fc(x)
+        # out[:, 0] = continuous/discrete reward
+        # out[:, 1] = probability of 'done' (sigmoid)
+        reward = out[:, 0]
+        done_prob = torch.sigmoid(out[:, 1])
+        return reward, done_prob
 
 class SimpleDQN(nn.Module):
     """A very lightweight CNN for a potato PC."""
@@ -41,58 +61,100 @@ class ReplayBuffer:
     def __len__(self):
         return len(self.buffer)
 
-def capture_window(window_title, resize_dim=(84, 84)):
-    """Captures the target window, converts to grayscale and resizes for potato PC."""
+def capture_page(page, resize_dim=(84, 84)):
+    """Captures the target Playwright page, converts to grayscale and resizes for potato PC."""
     try:
-        windows = gw.getWindowsWithTitle(window_title)
-        if not windows:
+        screenshot_bytes = page.screenshot()
+        # Convert bytes to numpy array
+        nparr = np.frombuffer(screenshot_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        if img is None:
             return None
-        win = windows[0]
 
-        # bounding box of the window
-        monitor = {
-            "top": win.top,
-            "left": win.left,
-            "width": win.width,
-            "height": win.height
-        }
+        # Convert to grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        with mss.mss() as sct:
-            sct_img = sct.grab(monitor)
+        # Resize to smaller dimensions
+        resized = cv2.resize(gray, resize_dim, interpolation=cv2.INTER_AREA)
 
-            # Convert to numpy array
-            img = np.array(sct_img)
-
-            # Convert to grayscale
-            gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
-
-            # Resize to smaller dimensions (e.g. 84x84 is standard for DQN)
-            resized = cv2.resize(gray, resize_dim, interpolation=cv2.INTER_AREA)
-
-            return resized
+        return resized
     except Exception as e:
-        print(f"Error capturing window: {e}")
+        print(f"Error capturing page: {e}")
         return None
 
 import threading
 import time
-import pyautogui
 
-# Example action space: Up, Down, Left, Right, None
-ACTIONS = ['up', 'down', 'left', 'right', 'space']
+# Example action space: Up, Down, Left, Right, None, plus mouse movements
+ACTIONS = [
+    'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space',
+    'mouse_up', 'mouse_down', 'mouse_left', 'mouse_right', 'click'
+]
 
-def perform_action(action_idx):
-    if action_idx < len(ACTIONS):
-        pyautogui.press(ACTIONS[action_idx])
+def perform_action(page, action_idx):
+    if action_idx >= len(ACTIONS):
+        return
+
+    action = ACTIONS[action_idx]
+
+    if action.startswith('Arrow') or action == 'Space':
+        page.keyboard.press(action)
+    elif action.startswith('mouse_'):
+        # In a real setup, you might want to track current coordinates and move relative to them.
+        # This is a simplified example of jumping to predefined zones or moving relative.
+        # Here we just execute a dummy relative move by getting the bounding box or center.
+        # Since we don't track absolute state easily here, let's do small relative moves from center.
+
+        viewport = page.viewport_size
+        if not viewport:
+            viewport = {'width': 800, 'height': 600}
+
+        # Get current mouse position conceptually (Playwright doesn't expose it directly)
+        # So we just do a click in center to ensure focus, then use a standard offset.
+        # A more complex bot would store its x,y. We'll store it in the page object dynamically.
+        if not hasattr(page, 'bot_mouse_x'):
+            page.bot_mouse_x = viewport['width'] / 2
+            page.bot_mouse_y = viewport['height'] / 2
+
+        step = 50
+        if action == 'mouse_up':
+            page.bot_mouse_y = max(0, page.bot_mouse_y - step)
+        elif action == 'mouse_down':
+            page.bot_mouse_y = min(viewport['height'], page.bot_mouse_y + step)
+        elif action == 'mouse_left':
+            page.bot_mouse_x = max(0, page.bot_mouse_x - step)
+        elif action == 'mouse_right':
+            page.bot_mouse_x = min(viewport['width'], page.bot_mouse_x + step)
+
+        page.mouse.move(page.bot_mouse_x, page.bot_mouse_y)
+
+    elif action == 'click':
+        # Click at the current stored location if it exists, otherwise center
+        if hasattr(page, 'bot_mouse_x'):
+            page.mouse.click(page.bot_mouse_x, page.bot_mouse_y)
+        else:
+            page.mouse.click(400, 300)
 
 class RLBotGUI:
     def __init__(self, root):
         self.root = root
 
+        # Chrome Debugging
+        self.chrome_port = tk.StringVar(value="9222")
+        self.pages_data = []
+
         # RL Setup
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = SimpleDQN(1, len(ACTIONS)).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+
+        # Reward Model Setup
+        self.reward_model = RewardModel(1).to(self.device)
+        # In a real scenario, you'd load pre-trained weights for the reward model
+        # self.reward_model.load_state_dict(torch.load('reward_model.pth'))
+        self.reward_model.eval() # Since it just predicts, we keep it in eval mode
+
         self.memory = ReplayBuffer(5000)
         self.batch_size = 32
         self.gamma = 0.99
@@ -103,34 +165,47 @@ class RLBotGUI:
         self.bot_thread = None
         self.root.title("RL Game Bot")
 
-        self.target_window = tk.StringVar()
+        self.target_tab = tk.StringVar()
         self.exp_folder = tk.StringVar()
         self.is_running = False
 
-        # Window Selection
-        ttk.Label(root, text="Select Target Window:").grid(row=0, column=0, padx=10, pady=10, sticky="w")
-        self.window_combobox = ttk.Combobox(root, textvariable=self.target_window, width=40)
-        self.window_combobox.grid(row=0, column=1, padx=10, pady=10)
-        self.refresh_windows()
+        # Port Selection
+        ttk.Label(root, text="Chrome Debugging Port:").grid(row=0, column=0, padx=10, pady=10, sticky="w")
+        ttk.Entry(root, textvariable=self.chrome_port, width=10).grid(row=0, column=1, sticky="w", padx=10)
 
-        ttk.Button(root, text="Refresh", command=self.refresh_windows).grid(row=0, column=2, padx=10, pady=10)
+        # Tab Selection
+        ttk.Label(root, text="Select Target Tab:").grid(row=1, column=0, padx=10, pady=10, sticky="w")
+        self.tab_combobox = ttk.Combobox(root, textvariable=self.target_tab, width=40)
+        self.tab_combobox.grid(row=1, column=1, padx=10, pady=10)
+        self.refresh_tabs()
+
+        ttk.Button(root, text="Refresh", command=self.refresh_tabs).grid(row=1, column=2, padx=10, pady=10)
 
         # Experience Folder Selection
-        ttk.Label(root, text="Experience Folder:").grid(row=1, column=0, padx=10, pady=10, sticky="w")
-        ttk.Entry(root, textvariable=self.exp_folder, width=40, state="readonly").grid(row=1, column=1, padx=10, pady=10)
-        ttk.Button(root, text="Browse", command=self.browse_folder).grid(row=1, column=2, padx=10, pady=10)
+        ttk.Label(root, text="Experience Folder:").grid(row=2, column=0, padx=10, pady=10, sticky="w")
+        ttk.Entry(root, textvariable=self.exp_folder, width=40, state="readonly").grid(row=2, column=1, padx=10, pady=10)
+        ttk.Button(root, text="Browse", command=self.browse_folder).grid(row=2, column=2, padx=10, pady=10)
 
         # Controls
         self.start_btn = ttk.Button(root, text="Start", command=self.toggle_bot)
-        self.start_btn.grid(row=2, column=1, pady=20)
+        self.start_btn.grid(row=3, column=1, pady=20)
 
-    def refresh_windows(self):
-        windows = [w.title for w in gw.getWindowsWithTitle('') if w.title]
-        # Filter for Chrome windows as requested
-        chrome_windows = [w for w in windows if 'Google Chrome' in w or 'Chrome' in w]
-        self.window_combobox['values'] = chrome_windows if chrome_windows else windows
-        if self.window_combobox['values']:
-            self.window_combobox.current(0)
+    def refresh_tabs(self):
+        try:
+            port = self.chrome_port.get()
+            response = requests.get(f"http://localhost:{port}/json")
+            if response.status_code == 200:
+                self.pages_data = [p for p in response.json() if p['type'] == 'page']
+                tab_titles = [f"{p['title']} ({p['url']})" for p in self.pages_data]
+                self.tab_combobox['values'] = tab_titles
+                if tab_titles:
+                    self.tab_combobox.current(0)
+            else:
+                messagebox.showwarning("Warning", "Could not fetch tabs. Make sure Chrome is running with --remote-debugging-port.")
+        except requests.exceptions.RequestException:
+            messagebox.showwarning("Warning", "Could not connect to Chrome. Make sure it is running with --remote-debugging-port=" + self.chrome_port.get())
+            self.tab_combobox['values'] = []
+            self.pages_data = []
 
     def browse_folder(self):
         folder = filedialog.askdirectory()
@@ -138,8 +213,8 @@ class RLBotGUI:
             self.exp_folder.set(folder)
 
     def toggle_bot(self):
-        if not self.target_window.get():
-            messagebox.showerror("Error", "Please select a target window.")
+        if not self.target_tab.get() or not self.pages_data:
+            messagebox.showerror("Error", "Please select a target tab.")
             return
         if not self.exp_folder.get():
             messagebox.showerror("Error", "Please select an experience folder.")
@@ -148,7 +223,16 @@ class RLBotGUI:
         self.is_running = not self.is_running
         if self.is_running:
             self.start_btn.config(text="Stop")
-            print(f"Bot started. Window: {self.target_window.get()}, Folder: {self.exp_folder.get()}")
+
+            selected_idx = self.tab_combobox.current()
+            if selected_idx < 0:
+                self.is_running = False
+                self.start_btn.config(text="Start")
+                return
+
+            self.selected_websocket_url = self.pages_data[selected_idx]['webSocketDebuggerUrl']
+
+            print(f"Bot started. Tab: {self.target_tab.get()}, Folder: {self.exp_folder.get()}")
             self.bot_thread = threading.Thread(target=self.run_bot)
             self.bot_thread.start()
         else:
@@ -156,10 +240,47 @@ class RLBotGUI:
             print("Bot stopped.")
 
     def run_bot(self):
-        window_title = self.target_window.get()
         exp_dir = self.exp_folder.get()
+        ws_url = getattr(self, 'selected_websocket_url', None)
 
-        state = capture_window(window_title)
+        if not ws_url:
+            print("No WebSocket URL found.")
+            self.is_running = False
+            self.root.after(0, lambda: self.start_btn.config(text="Start"))
+            return
+
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.connect_over_cdp(ws_url)
+                # Usually there's one context and we find the page that matches the websocket
+                contexts = browser.contexts
+                if not contexts:
+                    print("No browser contexts found.")
+                    return
+
+                target_page = None
+                for context in contexts:
+                    for page in context.pages:
+                        # Find the active page
+                        target_page = page
+                        break
+                    if target_page: break
+
+                if not target_page:
+                    print("Could not attach to the specific page.")
+                    self.is_running = False
+                    self.root.after(0, lambda: self.start_btn.config(text="Start"))
+                    return
+
+                self._rl_loop(target_page, exp_dir)
+
+        except Exception as e:
+            print(f"Playwright connection error: {e}")
+            self.is_running = False
+            self.root.after(0, lambda: self.start_btn.config(text="Start"))
+
+    def _rl_loop(self, page, exp_dir):
+        state = capture_page(page)
         if state is None:
             print("Failed to capture initial state.")
             self.is_running = False
@@ -180,19 +301,24 @@ class RLBotGUI:
                 action = q_values.argmax().item()
 
             # Perform action
-            perform_action(action)
+            perform_action(page, action)
 
             # Wait a bit for the game to react
             time.sleep(0.1)
 
             # Capture next state
-            next_state = capture_window(window_title)
+            next_state = capture_page(page)
             if next_state is None:
                 continue
 
-            # Dummy reward (in a real game you'd read the score from the screen or memory)
-            reward = 0.1
-            done = False # Dummy done flag
+            # Use the RewardModel to evaluate the frame
+            with torch.no_grad():
+                ns_tensor = torch.FloatTensor(next_state).unsqueeze(0).unsqueeze(0).to(self.device)
+                pred_reward, pred_done = self.reward_model(ns_tensor)
+
+                reward = pred_reward.item()
+                # If probability of done is > 0.5, we consider the episode finished
+                done = pred_done.item() > 0.5
 
             # Store experience
             self.memory.push(state, action, reward, next_state, done)
