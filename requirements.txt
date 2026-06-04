@@ -1,0 +1,11 @@
+torch
+torchvision
+torchaudio
+opencv-python
+pillow
+numpy
+playwright
+requests
+transformers
+einops
+timm
