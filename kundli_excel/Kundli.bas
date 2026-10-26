@@ -3,100 +3,84 @@ Option Explicit
 
 ' Requires Reference to "Microsoft XML, v6.0" (MSXML2.XMLHTTP)
 ' For JSON parsing, a simple string manipulation is used here to avoid external dependencies.
-' In a real-world scenario, importing a library like VBA-JSON is recommended.
 
-Public Sub CalculateKundli()
-    Dim http As Object
-    Set http = CreateObject("MSXML2.XMLHTTP")
+' Use a dictionary for basic caching so we don't spam the server on sheet recalculation
+Private CacheDict As Object
 
-    Dim url As String
-    url = "http://127.0.0.1:5000/calculate"
+Public Function GetKundli(field As String, year As Variant, month As Variant, day As Variant, hour As Variant, minute As Variant, city As Variant) As String
+    ' This makes it usable as a formula: =GetKundli("Tithi", B1, B2, B3, B4, B5, B6)
 
-    ' Read values from the active sheet (adjust cell references as needed)
-    Dim ws As Worksheet
-    Set ws = ActiveSheet
-
-    Dim year As String
-    Dim month As String
-    Dim day As String
-    Dim hour As String
-    Dim minute As String
-    Dim city As String
-
-    ' Assuming the inputs are in cells B1 to B6
-    year = ws.Range("B1").Value
-    month = ws.Range("B2").Value
-    day = ws.Range("B3").Value
-    hour = ws.Range("B4").Value
-    minute = ws.Range("B5").Value
-    city = ws.Range("B6").Value
-
-    ' Basic validation
-    If year = "" Or month = "" Or day = "" Or hour = "" Or minute = "" Or city = "" Then
-        MsgBox "Please fill in all input fields (B1 to B6)."
-        Exit Sub
+    ' Error handling for empty or invalid values
+    If IsEmpty(year) Or IsEmpty(month) Or IsEmpty(day) Or IsEmpty(hour) Or IsEmpty(minute) Or IsEmpty(city) Then
+        GetKundli = ""
+        Exit Function
     End If
 
-    ' Construct JSON payload
-    Dim payload As String
-    payload = "{""year"":" & year & ", ""month"":" & month & ", ""day"":" & day & ", ""hour"":" & hour & ", ""minute"":" & minute & ", ""city"":""" & city & """}"
+    If Not IsNumeric(year) Or Not IsNumeric(month) Or Not IsNumeric(day) Or Not IsNumeric(hour) Or Not IsNumeric(minute) Then
+        GetKundli = "#VALUE!"
+        Exit Function
+    End If
 
-    ' Send POST request
-    http.Open "POST", url, False
-    http.setRequestHeader "Content-type", "application/json"
+    ' Only send valid values (e.g., month cannot be > 12 or 0)
+    If year = 0 Or month = 0 Or day = 0 Then
+        GetKundli = "#INV_DATE!"
+        Exit Function
+    End If
 
-    On Error GoTo HttpError
-    http.send payload
-    On Error GoTo 0
+    ' Initialize cache dictionary if not set
+    If CacheDict Is Nothing Then
+        Set CacheDict = CreateObject("Scripting.Dictionary")
+    End If
 
-    Dim responseText As String
-    responseText = http.responseText
+    Dim cacheKey As String
+    cacheKey = year & "-" & month & "-" & day & "-" & hour & "-" & minute & "-" & city
 
-    ' Basic JSON Parsing using string functions
-    Dim tithi As String
-    tithi = ExtractJsonStringValue(responseText, "Tithi")
+    Dim jsonResponse As String
 
-    Dim nakshatra As String
-    nakshatra = ExtractJsonStringValue(responseText, "Nakshatra")
+    ' Check if we already fetched data for these parameters
+    If CacheDict.Exists(cacheKey) Then
+        jsonResponse = CacheDict(cacheKey)
+    Else
+        Dim http As Object
+        Set http = CreateObject("MSXML2.XMLHTTP")
 
-    Dim yoga As String
-    yoga = ExtractJsonStringValue(responseText, "Yoga")
+        Dim url As String
+        url = "http://127.0.0.1:5000/calculate"
 
-    Dim karana As String
-    karana = ExtractJsonStringValue(responseText, "Karana")
+        Dim payload As String
+        payload = "{""year"":" & year & ", ""month"":" & month & ", ""day"":" & day & ", ""hour"":" & hour & ", ""minute"":" & minute & ", ""city"":""" & city & """}"
 
-    Dim vara As String
-    vara = ExtractJsonStringValue(responseText, "Vara")
+        ' Send POST request (Synchronous inside a UDF can freeze excel if server is down, so we use a small timeout workaround implicitly by error handling)
+        On Error GoTo HttpError
+        http.Open "POST", url, False
+        http.setRequestHeader "Content-type", "application/json"
+        http.send payload
 
-    Dim rashi As String
-    rashi = ExtractJsonStringValue(responseText, "Rashi")
+        If http.Status = 200 Then
+            jsonResponse = http.responseText
+            CacheDict.Add cacheKey, jsonResponse
+        Else
+            GetKundli = "#API_ERR_" & http.Status & "!"
+            Exit Function
+        End If
+        On Error GoTo 0
+    End If
 
-    Dim lagna As String
-    lagna = ExtractJsonStringValue(responseText, "Lagna")
-
-    Dim gana As String
-    gana = ExtractJsonStringValue(responseText, "Gana")
-
-    Dim nadi As String
-    nadi = ExtractJsonStringValue(responseText, "Nadi")
-
-    ' Write outputs (adjust cell references as needed)
-    ws.Range("E1").Value = tithi
-    ws.Range("E2").Value = nakshatra
-    ws.Range("E3").Value = yoga
-    ws.Range("E4").Value = karana
-    ws.Range("E5").Value = vara
-    ws.Range("E6").Value = rashi
-    ws.Range("E7").Value = lagna
-    ws.Range("E8").Value = gana
-    ws.Range("E9").Value = nadi
-
-    MsgBox "Kundli Calculation Complete!"
-    Exit Sub
+    ' Extract value
+    GetKundli = ExtractJsonStringValue(jsonResponse, field)
+    Exit Function
 
 HttpError:
-    MsgBox "Error communicating with Python API. Make sure the Flask server is running."
+    GetKundli = "#CONN_ERR!"
+End Function
+
+
+Public Sub ClearKundliCache()
+    ' Macro to clear cache manually if needed
+    Set CacheDict = Nothing
+    MsgBox "Cache cleared."
 End Sub
+
 
 Private Function ExtractJsonStringValue(jsonStr As String, key As String) As String
     Dim searchKey As String

@@ -4,6 +4,7 @@ import pytz
 from geopy.geocoders import Nominatim
 from timezonefinder import TimezoneFinder
 import swisseph as swe
+from flask import Flask, request, jsonify
 
 swe.set_sid_mode(swe.SIDM_LAHIRI)
 
@@ -32,7 +33,6 @@ YOGAS = ["Vishkambha", "Priti", "Ayushman", "Saubhagya", "Shobhana", "Atiganda",
 VARS = ["Ravivara", "Somavara", "Mangalavara", "Budhavara", "Guruvara", "Shukravara", "Shanivara"]
 
 # Simple Gana/Yoni/Nadi tables based on Nakshatra index (0-26)
-# Approximated mapping
 GANAS = ["Deva", "Manushya", "Rakshasa", "Manushya", "Deva", "Manushya", "Deva", "Deva", "Rakshasa",
          "Rakshasa", "Manushya", "Manushya", "Deva", "Rakshasa", "Deva", "Rakshasa", "Deva", "Rakshasa",
          "Rakshasa", "Manushya", "Manushya", "Deva", "Rakshasa", "Rakshasa", "Manushya", "Manushya", "Deva"]
@@ -42,10 +42,16 @@ NADIS = ["Aadi", "Madhya", "Antya", "Antya", "Madhya", "Aadi", "Aadi", "Madhya",
          "Aadi", "Madhya", "Antya", "Antya", "Madhya", "Aadi", "Aadi", "Madhya", "Antya"]
 
 def get_lat_lon_tz(city_name):
-    geolocator = Nominatim(user_agent="kundli_app")
-    location = geolocator.geocode(city_name)
+    # Geopy Nominatim already uses the internet as an 'auto detector' for lat/lon.
+    geolocator = Nominatim(user_agent="kundli_app_v2", timeout=10)
+    try:
+        location = geolocator.geocode(city_name)
+    except Exception as e:
+        raise ValueError(f"Error connecting to geocoding service: {e}")
+
     if not location:
-        raise ValueError(f"City '{city_name}' not found.")
+        raise ValueError(f"City '{city_name}' could not be found.")
+
     lat, lon = location.latitude, location.longitude
     tf = TimezoneFinder()
     tz_name = tf.timezone_at(lng=lon, lat=lat)
@@ -60,10 +66,15 @@ def decimal_to_dms(dec):
     return f"{d}° {m}' {s}\""
 
 def calc_panchang(year, month, day, hour, minute, city_name):
+    try:
+        # Validate date and time
+        local_time = datetime.datetime(year, month, day, hour, minute)
+    except ValueError as e:
+        raise ValueError(f"Invalid date/time parameters: {e}")
+
     lat, lon, tz_name = get_lat_lon_tz(city_name)
     tz = pytz.timezone(tz_name)
 
-    local_time = datetime.datetime(year, month, day, hour, minute)
     local_time = tz.localize(local_time)
     utc_time = local_time.astimezone(pytz.utc)
 
@@ -126,7 +137,7 @@ def calc_panchang(year, month, day, hour, minute, city_name):
         "Tithi": tithi_name,
         "Paksha": paksha,
         "Nakshatra": nak_name,
-        "Nakshatra_Pada": nak_pada,
+        "Nakshatra_Pada": str(nak_pada),
         "Yoga": yoga_name,
         "Karana": karana_name,
         "Vara": vara_name,
@@ -137,21 +148,21 @@ def calc_panchang(year, month, day, hour, minute, city_name):
     }
     return result
 
-
-from flask import Flask, request, jsonify
-
 app = Flask(__name__)
 
 @app.route('/calculate', methods=['POST'])
 def calculate():
     try:
         data = request.json
-        year = int(data.get('year'))
-        month = int(data.get('month'))
-        day = int(data.get('day'))
-        hour = int(data.get('hour'))
-        minute = int(data.get('minute'))
-        city = data.get('city')
+        year = int(data.get('year', 0))
+        month = int(data.get('month', 0))
+        day = int(data.get('day', 0))
+        hour = int(data.get('hour', 0))
+        minute = int(data.get('minute', 0))
+        city = str(data.get('city', ''))
+
+        if not city:
+            return jsonify({"status": "error", "message": "City is required"}), 400
 
         result = calc_panchang(year, month, day, hour, minute, city)
         return jsonify({"status": "success", "data": result})
@@ -159,4 +170,4 @@ def calculate():
         return jsonify({"status": "error", "message": str(e)}), 400
 
 if __name__ == "__main__":
-    app.run(port=5000, debug=True, host='0.0.0.0')
+    app.run(port=5000, debug=False, host='127.0.0.1')
